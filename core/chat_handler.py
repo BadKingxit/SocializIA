@@ -461,7 +461,7 @@ def _extract_math_expression(message: str) -> Optional[str]:
     text = text.replace(",", " ")
     text = _normalize_spaces(text)
 
-    m = re.search(r"([-+*/()%d.s]{3,})", text)
+    m = re.search(r"([0-9+\-*/().%\s]{3,})", text)
     if not m:
         return None
 
