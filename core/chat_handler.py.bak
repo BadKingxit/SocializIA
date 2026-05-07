@@ -1,0 +1,261 @@
+import os
+import json
+import logging
+import random
+import re
+import numpy as np
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from memory.db import init_db, get_conn
+from memory.working import add_turn, get_history
+from memory.episodic import save_episode, get_recent_episodes
+from memory.semantic import get_facts
+from memory.soul_map import init_soul_map
+from emotion.state import EmotionalState
+from emotion.appraisal import appraise
+
+BASE_PATH = "SocializIA/data/users/"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# RESPONSE CACHE
+_response_cache: Dict[str, Dict] = {}
+
+def get_cached_response(session_id: str, message: str) -> Optional[str]:
+    key = f"{session_id}:{message}"
+    if key in _response_cache:
+        return _response_cache[key].get("reply")
+    return None
+
+def cache_response(session_id: str, message: str, reply: str):
+    key = f"{session_id}:{message}"
+    _response_cache[key] = {
+        "reply": reply,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    if len(_response_cache) > 1000:
+        oldest_key = min(
+            _response_cache.keys(),
+            key=lambda k: _response_cache[k]["timestamp"]
+        )
+        del _response_cache[oldest_key]
+
+
+# FILE UTILITIES
+def user_path(userid):
+    p = f"{BASE_PATH}{userid}"
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def mem_file(userid):
+    return f"{user_path(userid)}/mem.json"
+
+def vec_file(userid):
+    return f"{user_path(userid)}/vec.json"
+
+def load_json(p, d):
+    if not os.path.exists(p):
+        return d
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return d
+
+def save_json(p, d):
+    json.dump(d, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+
+def load_mem(userid):
+    return load_json(mem_file(userid), {"bond": 0.3, "chaos": 0.4, "last_topics": []})
+
+def save_mem(userid, m):
+    save_json(mem_file(userid), m)
+
+
+# EMBEDDING
+def embed(text):
+    import requests
+    key = os.environ.get("OPENROUTER_API_KEY")
+
+    try:
+        r = requests.post(
+            "https://openrouter.ai/api/v1/embeddings",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "text-embedding-3-small", "input": text},
+            timeout=30,
+        )
+        data = r.json()
+        return np.array(data["data"][0]["embedding"], dtype=np.float32)
+    except Exception as e:
+        logger.warning(f"Embedding error: {e}")
+        return np.zeros(384, dtype=np.float32)
+
+
+# TAGS
+def infer_tags(text: str) -> List[str]:
+    tags = []
+    t = text.lower()
+
+    if any(w in t for w in ["godot","unity","game"]):
+        tags.append("game")
+    if any(w in t for w in ["python","code"]):
+        tags.append("code")
+
+    return tags if tags else ["general"]
+
+
+def add_semantic(userid, text):
+    try:
+        data = load_json(vec_file(userid), [])
+        chunks = [text[i:i+200] for i in range(0, len(text), 200)]
+
+        for c in chunks:
+            data.append({
+                "text": c,
+                "emb": embed(c).tolist(),
+                "tags": infer_tags(c),
+                "time": datetime.now().isoformat()
+            })
+
+        if len(data) > 500:
+            data = data[-400:]
+
+        save_json(vec_file(userid), data)
+
+    except Exception as e:
+        logger.warning(f"Semantic store error: {e}")
+
+
+def search_semantic(userid, query, k=5):
+    data = load_json(vec_file(userid), [])
+    if not data:
+        return []
+
+    try:
+        q = embed(query)
+        scored = []
+
+        for d in data:
+            emb = np.array(d["emb"])
+            sim = float(np.dot(q, emb) / (np.linalg.norm(q)*np.linalg.norm(emb)+1e-9))
+            scored.append((sim, d["text"]))
+
+        scored.sort(reverse=True)
+        return [x[1] for x in scored[:k]]
+
+    except Exception as e:
+        logger.warning(f"Semantic search error: {e}")
+        return []
+
+
+# INTENT
+def intent_stage(message: str) -> Dict:
+    try:
+        return {
+            "intent": "unknown",
+            "topic": "",
+            "sentiment": "neutral"
+        }
+    except Exception:
+        return {
+            "intent": "unknown",
+            "topic": "",
+            "sentiment": "neutral"
+        }
+
+
+# MEMORY
+def memory_stage(userid: str, sessionid: str, query: str) -> Dict:
+    try:
+        all_history = get_history(sessionid) or []
+        working = all_history[-3:]
+
+        episodic = get_recent_episodes(userid, limit=5) or []
+        semantic = (get_facts(userid) or [])[:3]
+        relevant = search_semantic(userid, query, k=3)
+
+        return {
+            "working": working,
+            "episodic": episodic,
+            "semantic": semantic,
+            "relevant_semantic": relevant
+        }
+
+    except Exception as e:
+        logger.warning(f"Memory error: {e}")
+        return {
+            "working": [],
+            "episodic": [],
+            "semantic": [],
+            "relevant_semantic": []
+        }
+
+
+# EMOTION
+def emotion_stage(userid: str, message: str, state: EmotionalState) -> Dict:
+    try:
+        dv, da, reason = appraise(message, state)
+        state.update(dv, da, reason)
+
+        return {
+            "state": state.to_dict(),
+            "deltas": {"valence": dv, "arousal": da},
+            "reason": reason
+        }
+
+    except Exception as e:
+        logger.warning(f"Emotion error: {e}")
+        return {
+            "state": state.to_dict(),
+            "deltas": {"valence": 0, "arousal": 0},
+            "reason": "neutral"
+        }
+
+
+# LLM
+def llm(messages, temp=0.8):
+    return "ok"
+
+
+# MAIN
+def handle_chat(userid, sessionid, message):
+
+    cached = get_cached_response(sessionid, message)
+    if cached:
+        return {
+            "reply": cached,
+            "cached": True
+        }
+
+    try:
+        init_db()
+        init_soul_map(userid)
+
+        mem = load_mem(userid)
+        state = EmotionalState()
+
+        intent = intent_stage(message)
+        add_turn(sessionid, userid, "user", message)
+
+        memory = memory_stage(userid, sessionid, message)
+        emotion = emotion_stage(userid, message, state)
+
+        reply = llm([], temp=0.7)
+
+        add_turn(sessionid, userid, "assistant", reply)
+
+        cache_response(sessionid, message, reply)
+
+        return {
+            "reply": reply,
+            "cached": False
+        }
+
+    except Exception as e:
+        logger.error(f"Handler error: {e}")
+        return {
+            "reply": "erro",
+            "cached": False
+        }

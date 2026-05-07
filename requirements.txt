@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+numpy
+python-multipart
+pydantic
+edge-tts
+httpx

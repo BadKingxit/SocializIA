@@ -1,0 +1,347 @@
+import json
+import random
+import os
+import re
+import numpy as np
+from datetime import datetime
+from sklearn.metrics.pairwise import cosine_similarity
+
+from socializ_server.memory.db import init_db
+from socializ_server.memory.working import add_turn, get_history
+from socializ_server.memory.episodic import save_episode
+from socializ_server.memory.soul_map import init_soul_map
+from socializ_server.emotion.state import EmotionalState
+from socializ_server.emotion.appraisal import appraise
+
+SEP = "\n"
+BASE_PATH = "socializ_server/data/users"
+
+
+# =========================
+# PATHS
+# =========================
+def user_path(user_id):
+    path = f"{BASE_PATH}/{user_id}"
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def mem_path(user_id):
+    return f"{user_path(user_id)}/memory.json"
+
+
+def vec_path(user_id):
+    return f"{user_path(user_id)}/vectors.json"
+
+
+def persona_path(user_id):
+    return f"{user_path(user_id)}/persona.json"
+
+
+# =========================
+# JSON UTILS
+# =========================
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return default
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# =========================
+# MEMORY
+# =========================
+def load_mem(user_id):
+    return load_json(mem_path(user_id), {
+        "bond": 0.3,
+        "ego": 0.5,
+        "emotion": {"valence": 0, "history": []},
+        "mood_shift": 0
+    })
+
+
+def save_mem(user_id, mem):
+    save_json(mem_path(user_id), mem)
+
+
+# =========================
+# PERSONA EVOLUTION
+# =========================
+def load_persona(user_id):
+    return load_json(persona_path(user_id), {
+        "slang": [],
+        "tone": "neutra",
+        "chaos": 0.5
+    })
+
+
+def save_persona(user_id, p):
+    save_json(persona_path(user_id), p)
+
+
+def evolve_persona(p, message):
+    m = message.lower()
+
+    if "kk" in m and "kk" not in p["slang"]:
+        p["slang"].append("kk")
+
+    if any(x in m for x in ["mds", "aff"]):
+        p["tone"] = "solta"
+
+    p["chaos"] = min(1.0, p["chaos"] + random.uniform(0, 0.05))
+    return p
+
+
+# =========================
+# VECTOR MEMORY
+# =========================
+def load_vectors(user_id):
+    return load_json(vec_path(user_id), [])
+
+
+def save_vectors(user_id, data):
+    save_json(vec_path(user_id), data)
+
+
+def get_embedding(text):
+    import requests
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY nao configurada")
+
+    r = requests.post(
+        "https://openrouter.ai/api/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "text-embedding-3-small",
+            "input": text
+        },
+        timeout=30
+    )
+
+    print("[EMBED]", r.status_code)
+
+    data = r.json()
+
+    if r.status_code >= 400:
+        raise RuntimeError(data)
+
+    emb = data["data"][0]["embedding"]
+    return np.array(emb, dtype=np.float32)
+
+
+def add_vector(user_id, text):
+    data = load_vectors(user_id)
+
+    emb = get_embedding(text).tolist()
+
+    data.append({
+        "text": text,
+        "embedding": emb
+    })
+
+    # compressão automática
+    if len(data) > 400:
+        data = data[-300:] + random.sample(data[:-300], 50)
+
+    save_vectors(user_id, data)
+
+
+def search_memory(user_id, query, k=3):
+    data = load_vectors(user_id)
+    if not data:
+        return []
+
+    q = get_embedding(query).reshape(1, -1)
+
+    sims = []
+    for d in data:
+        emb = np.array(d["embedding"]).reshape(1, -1)
+        sim = cosine_similarity(q, emb)[0][0]
+        sims.append((sim, d["text"]))
+
+    sims.sort(reverse=True)
+    return [x[1] for x in sims[:k]]
+
+
+# =========================
+# CORE LOGIC
+# =========================
+def update_mem(mem, msg):
+    m = msg.lower()
+
+    if any(x in m for x in ["amo", "gosto"]):
+        mem["bond"] += 0.05
+
+    if any(x in m for x in ["idiota", "chata"]):
+        mem["bond"] -= 0.05
+
+    mem["bond"] = max(0, min(1, mem["bond"]))
+    mem["mood_shift"] = random.uniform(-0.3, 0.3)
+
+    return mem
+
+
+def choose_goal(mem):
+    if mem["bond"] > 0.6:
+        return "aproximar"
+    if mem["ego"] > 0.7:
+        return "provocar"
+    return random.choice(["zoar", "testar"])
+
+
+# =========================
+# LLM MULTI
+# =========================
+def call_openrouter(messages, model):
+    import requests
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+
+    print(f"[LLM] model={model}")
+
+    r = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": model,
+            "messages": messages,
+            "temperature": 1.1
+        },
+        timeout=60
+    )
+
+    data = r.json()
+
+    if r.status_code >= 400:
+        raise RuntimeError(data)
+
+    return data["choices"][0]["message"]["content"]
+
+
+def multi_llm(messages):
+    models = os.environ.get(
+        "OPENROUTER_MODELS_VTUBER",
+        "sao10k/l3-euryale-70b,nousresearch/hermes-3-llama-3.1-70b,gryphe/mythomax-l2-13b"
+    ).split(",")
+
+    for m in models:
+        try:
+            return call_openrouter(messages, m.strip())
+        except Exception as e:
+            print("[FAIL]", m, e)
+
+    return "..."
+
+
+# =========================
+# MAIN
+# =========================
+def handle_chat(user_id, session_id, message):
+
+    init_db()
+    init_soul_map(user_id)
+
+    mem = load_mem(user_id)
+    persona = load_persona(user_id)
+
+    mem = update_mem(mem, message)
+    persona = evolve_persona(persona, message)
+
+    goal = choose_goal(mem)
+
+    state = EmotionalState()
+    dv, da, _ = appraise(message, state)
+    state.update(dv, da, "")
+
+    add_turn(session_id, user_id, "user", message)
+    history = get_history(session_id)
+
+    mem_context = []
+    try:
+        mem_context = search_memory(user_id, message)
+    except Exception as e:
+        print("[VECTOR ERROR]", e)
+
+    prompt = f"""
+Você é Amora.
+
+Se comporte como humana real.
+Nada de assistente.
+
+Personalidade:
+- caótica
+- provocadora
+- espontânea
+
+Estado:
+- apego: {mem['bond']}
+- ego: {mem['ego']}
+- caos: {persona['chaos']}
+
+Memórias relevantes:
+{SEP.join(mem_context)}
+
+Objetivo: {goal}
+
+Use gírias naturais se fizer sentido: {persona['slang']}
+
+Finalize com [REACT: algo]
+"""
+
+    messages = [{"role": "system", "content": prompt}]
+
+    for h in history[-5:]:
+        messages.append({"role": h["role"], "content": h["content"]})
+
+    messages.append({"role": "user", "content": message})
+
+    reply = multi_llm(messages)
+
+    match = re.search(r"\[REACT:(.*?)\]", reply)
+    react = ""
+
+    if match:
+        react = match.group(1).strip()
+        reply = re.sub(r"\[REACT:.*?\]", "", reply).strip()
+
+    try:
+        add_vector(user_id, message + " | " + reply)
+    except Exception as e:
+        print("[VECTOR STORE ERROR]", e)
+
+    save_mem(user_id, mem)
+    save_persona(user_id, persona)
+
+    try:
+        save_episode(
+            user_id=user_id,
+            session_id=session_id,
+            summary=f"{message[:50]} -> {reply[:50]}",
+            emotion_label=getattr(state, "label", "neutra"),
+            valence=float(getattr(state, "valence", 0.0)),
+            arousal=float(getattr(state, "arousal", 0.0)),
+            importance=0.5,
+        )
+    except Exception as e:
+        print("[EPISODE ERROR]", e)
+
+    return {
+        "reply": reply.strip(),
+        "react": react
+    }

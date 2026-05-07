@@ -1,0 +1,201 @@
+import os
+import io
+import wave
+import tempfile
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+router = APIRouter(prefix="/voice", tags=["voice"])
+
+PIPER_MODELS_DIR = Path(os.getenv("PIPER_MODELS_DIR", "models/piper"))
+DEFAULT_VOICE_ID = os.getenv("DEFAULT_VOICE_ID", "pt_BR-faber-medium")
+
+
+class TTSRequest(BaseModel):
+    text: str
+    voice_id: str = Field(default=DEFAULT_VOICE_ID)
+    effects: List[str] = Field(default_factory=list)
+    speaker_id: Optional[int] = None
+    noise_scale: float = 0.667
+    length_scale: float = 1.0
+    noise_w: float = 0.8
+    sentence_silence: float = 0.2
+
+
+def _model_paths(voice_id: str):
+    model_path = PIPER_MODELS_DIR / f"{voice_id}.onnx"
+    config_path = PIPER_MODELS_DIR / f"{voice_id}.onnx.json"
+    return model_path, config_path
+
+
+def _list_voices():
+    if not PIPER_MODELS_DIR.exists():
+        return []
+    voices = []
+    for f in PIPER_MODELS_DIR.glob("*.onnx"):
+        voice_id = f.stem
+        cfg = PIPER_MODELS_DIR / f"{voice_id}.onnx.json"
+        voices.append({
+            "voice_id": voice_id,
+            "model_path": str(f),
+            "config_exists": cfg.exists()
+        })
+    return sorted(voices, key=lambda x: x["voice_id"])
+
+
+def _apply_effects(raw_wav: bytes, effects: List[str]) -> bytes:
+    if not effects:
+        return raw_wav
+
+    import audioop
+
+    in_buf = io.BytesIO(raw_wav)
+    out_buf = io.BytesIO()
+
+    with wave.open(in_buf, "rb") as r:
+        params = r.getparams()
+        frames = r.readframes(r.getnframes())
+
+    sample_width = params.sampwidth
+    channels = params.nchannels
+    rate = params.framerate
+
+    data = frames
+
+    if "boost" in effects:
+        data = audioop.mul(data, sample_width, 1.35)
+
+    if "soft" in effects:
+        data = audioop.mul(data, sample_width, 0.85)
+
+    if "robot_soft" in effects:
+        step = max(1, int(rate / 70))
+        chunks = []
+        frame_size = sample_width * channels
+        total = len(data)
+        i = 0
+        toggle = False
+        while i < total:
+            part = data[i:i + step * frame_size]
+            if toggle:
+                part = audioop.mul(part, sample_width, 0.55)
+            chunks.append(part)
+            toggle = not toggle
+            i += step * frame_size
+        data = b"".join(chunks)
+
+    if "phone" in effects:
+        try:
+            mono = audioop.tomono(data, sample_width, 0.5, 0.5) if channels == 2 else data
+            low_rate, low = audioop.ratecv(mono, sample_width, 1, rate, 8000, None)
+            _, restored = audioop.ratecv(low, sample_width, 1, 8000, rate, None)
+            if channels == 2:
+                restored = audioop.tostereo(restored, sample_width, 1.0, 1.0)
+            data = restored
+        except Exception:
+            pass
+
+    if "cute" in effects:
+        data = audioop.mul(data, sample_width, 1.08)
+
+    with wave.open(out_buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(sample_width)
+        w.setframerate(rate)
+        w.writeframes(data)
+
+    return out_buf.getvalue()
+
+
+@router.get("/voices")
+def list_voices():
+    voices = _list_voices()
+    return {
+        "count": len(voices),
+        "default_voice_id": DEFAULT_VOICE_ID,
+        "voices": voices
+    }
+
+
+@router.post("/tts")
+def tts(req: TTSRequest):
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text vazio")
+
+    model_path, config_path = _model_paths(req.voice_id)
+    if not model_path.exists() or not config_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"voz '{req.voice_id}' não encontrada em {PIPER_MODELS_DIR}"
+        )
+
+    try:
+        from piper.voice import PiperVoice
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"erro importando piper: {e}")
+
+    try:
+        voice = PiperVoice.load(
+            str(model_path),
+            config_path=str(config_path),
+            use_cuda=False
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        with wave.open(tmp_path, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(voice.config.sample_rate)
+
+            synth_kwargs = {
+                "speaker_id": req.speaker_id,
+                "length_scale": req.length_scale,
+                "noise_scale": req.noise_scale,
+                "noise_w": req.noise_w,
+                "sentence_silence": req.sentence_silence
+            }
+
+            clean_kwargs = {}
+            for k, v in synth_kwargs.items():
+                if v is not None:
+                    clean_kwargs[k] = v
+
+            voice.synthesize(text, wav_file, **clean_kwargs)
+
+        raw_wav = Path(tmp_path).read_bytes()
+        Path(tmp_path).unlink(missing_ok=True)
+
+        final_wav = _apply_effects(raw_wav, req.effects)
+
+        headers = {
+            "X-Voice-Id": req.voice_id,
+            "X-Effects": ",".join(req.effects)
+        }
+
+        return StreamingResponse(
+            io.BytesIO(final_wav),
+            media_type="audio/wav",
+            headers=headers
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"erro gerando TTS: {e}")
+
+
+@router.get("/tts/info")
+def tts_info():
+    return JSONResponse({
+        "provider": "piper",
+        "models_dir": str(PIPER_MODELS_DIR),
+        "default_voice_id": DEFAULT_VOICE_ID,
+        "effects_supported": ["boost", "soft", "robot_soft", "phone", "cute"]
+    })

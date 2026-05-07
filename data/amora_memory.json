@@ -1,0 +1,10 @@
+{
+  "style": {},
+  "jokes": [],
+  "emotion": { "valence": 0, "history": [] },
+  "bond": 0.3,
+  "ego": 0.5,
+  "mood_shift": 0,
+  "goals": [],
+  "last_reflection": ""
+}

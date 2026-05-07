@@ -1,0 +1,241 @@
+import os, json, random, re
+import numpy as np
+from datetime import datetime
+
+from socializ_server.memory.db import init_db
+from socializ_server.memory.working import add_turn, get_history
+from socializ_server.memory.episodic import save_episode, get_recent_episodes
+from socializ_server.memory.soul_map import init_soul_map
+from socializ_server.emotion.state import EmotionalState
+from socializ_server.emotion.appraisal import appraise
+
+BASE_PATH = "socializ_server/data/users"
+
+########################################
+# MEMORY FILES
+########################################
+def user_path(user_id):
+    p = f"{BASE_PATH}/{user_id}"
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def mem_file(user_id):
+    return f"{user_path(user_id)}/mem.json"
+
+def vec_file(user_id):
+    return f"{user_path(user_id)}/vec.json"
+
+########################################
+# JSON
+########################################
+def load_json(p, d):
+    if not os.path.exists(p):
+        return d
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except:
+        return d
+
+def save_json(p, d):
+    json.dump(d, open(p,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+
+########################################
+# MEMORY CORE
+########################################
+def load_mem(user_id):
+    return load_json(mem_file(user_id), {
+        "bond":0.3,
+        "chaos":0.4,
+        "last_topics":[]
+    })
+
+def save_mem(user_id, m):
+    save_json(mem_file(user_id), m)
+
+########################################
+# EMBEDDING
+########################################
+def embed(text):
+    import requests
+    key = os.environ.get("OPENROUTER_API_KEY")
+
+    r = requests.post(
+        "https://openrouter.ai/api/v1/embeddings",
+        headers={"Authorization":f"Bearer {key}"},
+        json={"model":"text-embedding-3-small","input":text},
+        timeout=30
+    )
+
+    data = r.json()
+    return np.array(data["data"][0]["embedding"], dtype=np.float32)
+
+########################################
+# SEMANTIC MEMORY
+########################################
+def add_semantic(user_id, text):
+    data = load_json(vec_file(user_id), [])
+
+    chunks = [text[i:i+200] for i in range(0,len(text),200)]
+
+    for c in chunks:
+        data.append({
+            "text": c,
+            "emb": embed(c).tolist(),
+            "time": time.time()
+        })
+
+    if len(data) > 500:
+        data = data[-400:]
+
+    save_json(vec_file(user_id), data)
+
+def search_semantic(user_id, query, k=5):
+    data = load_json(vec_file(user_id), [])
+    if not data:
+        return []
+
+    q = embed(query)
+
+    scored = []
+    for d in data:
+        emb = np.array(d["emb"])
+        sim = np.dot(q, emb)/(np.linalg.norm(q)*np.linalg.norm(emb))
+        scored.append((sim, d["text"]))
+
+    scored.sort(reverse=True)
+    return [x[1] for x in scored[:k]]
+
+########################################
+# INTENT ENGINE
+########################################
+def decide_intent(mem, state):
+    if state.label in ["raiva","irritada"]:
+        return "provocar"
+    if mem["bond"] > 0.6:
+        return "aproximar"
+    if mem["chaos"] > 0.6:
+        return "zoar"
+    return "responder"
+
+########################################
+# SHIMEJI SPEECH
+########################################
+def build_shimeji(reply):
+    short = reply.split(".")[0][:40]
+
+    emojis = ["😐","😏","🔥","😝","🥱","🤨"]
+    return short, random.choice(emojis)
+
+########################################
+# CONTEXT (ATTENTION CHUNKS)
+########################################
+def build_context(history, episodes, semantic):
+    ctx = []
+
+    for h in history[-5:]:
+        ctx.append(f"{h['role']}: {h['content']}")
+
+    for e in episodes[:3]:
+        ctx.append(f"[episodio]: {e['summary']}")
+
+    for s in semantic[:3]:
+        ctx.append(f"[memoria]: {s}")
+
+    return "\n".join(ctx)
+
+########################################
+# LLM
+########################################
+def llm(messages, temp):
+    import requests
+    key = os.environ.get("OPENROUTER_API_KEY")
+
+    r = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization":f"Bearer {key}"},
+        json={
+            "model":"deepseek/deepseek-chat-v3-0324",
+            "messages":messages,
+            "temperature":temp
+        },
+        timeout=60
+    )
+
+    return r.json()["choices"][0]["message"]["content"]
+
+########################################
+# MAIN
+########################################
+def handle_chat(user_id, session_id, message):
+
+    init_db()
+    init_soul_map(user_id)
+
+    mem = load_mem(user_id)
+
+    state = EmotionalState()
+    dv, da, _ = appraise(message, state)
+    state.update(dv, da)
+
+    add_turn(session_id, user_id, "user", message)
+    history = get_history(session_id)
+
+    episodes = get_recent_episodes(user_id, 5)
+    semantic = search_semantic(user_id, message)
+
+    context = build_context(history, episodes, semantic)
+    intent = decide_intent(mem, state)
+
+    system = f"""
+Você é Amora.
+
+Humana, natural.
+
+INTENÇÃO: {intent}
+
+REGRAS:
+- responda direto
+- não invente coisas aleatórias
+- não repita assunto sem motivo
+
+CONTEXTO:
+{context}
+"""
+
+    messages = [
+        {"role":"system","content":system},
+        {"role":"user","content":message}
+    ]
+
+    temp = 0.8 + (mem["chaos"]*0.3)
+
+    reply = llm(messages, temp)
+
+    add_turn(session_id, user_id, "assistant", reply)
+
+    short, react = build_shimeji(reply)
+
+    try:
+        add_semantic(user_id, message + " " + reply)
+    except:
+        pass
+
+    save_episode(
+        user_id=user_id,
+        session_id=session_id,
+        summary=reply[:50],
+        emotion_label=state.label,
+        valence=state.valence,
+        arousal=state.arousal,
+        importance=0.6
+    )
+
+    save_mem(user_id, mem)
+
+    return {
+        "reply": reply,
+        "react": react,
+        "shimeji": short,
+        "emotional_state": state.to_dict(),
+        "actions": []
+    }
