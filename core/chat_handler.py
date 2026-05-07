@@ -423,7 +423,7 @@ def _postprocess_reply(reply: str) -> str:
             filtered.append(s)
 
     text = " ".join(filtered).strip()
-    text = re.sub(r"s+([,.;:!?])", r"\u0001", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     text = re.sub(r"(?i)\beu sou uma ia\b", "eu sou Amora", text)
     text = re.sub(r"(?i)\bcomo assistente virtual\b", "como Amora", text)
 
