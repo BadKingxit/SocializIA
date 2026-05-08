@@ -20,7 +20,7 @@ RVC_INDEX = os.environ.get(
 
 BACKEND_URL = os.environ.get(
     "BACKEND_URL",
-    "https://web-production-fc5d4.up.railway.app"
+    "https://web-production-6d0ed.up.railway.app"
 ).rstrip("/")
 
 
