@@ -1,56 +1,113 @@
-# RVC.py
-
 import os
+import tempfile
 import subprocess
-import uuid
+import httpx
 
-TEMP_DIR = "temp"
+RVC_ENABLED = os.environ.get(
+    "RVC_ENABLED",
+    "true"
+).lower() == "true"
+
+RVC_MODEL = os.environ.get(
+    "RVC_MODEL",
+    "models/amora.pth"
+)
+
+RVC_INDEX = os.environ.get(
+    "RVC_INDEX",
+    "models/amora.index"
+)
+
+BACKEND_URL = os.environ.get(
+    "BACKEND_URL",
+    "https://web-production-fc5d4.up.railway.app"
+).rstrip("/")
 
 
-class RVCService:
+async def _call_edge_tts(
+    payload,
+    auth_header
+) -> bytes:
 
-    def __init__(self):
-        self.rvc_model = "rvc_models/amora/model.pth"
-        self.rvc_index = "rvc_models/amora/model.index"
+    headers = {
+        "Content-Type": "application/json"
+    }
 
-    async def convert_voice(
-        self,
-        input_mp3: str,
-        pitch: int = 0
-    ) -> str:
+    if auth_header:
+        headers["Authorization"] = auth_header
 
-        output_path = os.path.join(
-            TEMP_DIR,
-            f"{uuid.uuid4()}.mp3"
+    async with httpx.AsyncClient(
+        timeout=120.0
+    ) as client:
+
+        resp = await client.post(
+            f"{BACKEND_URL}/voice/tts",
+            headers=headers,
+            json=payload
         )
 
-        cmd = [
-            "python",
-            "rvc_infer.py",
+        resp.raise_for_status()
 
-            "--input",
-            input_mp3,
+        return resp.content
 
-            "--output",
-            output_path,
 
-            "--model",
-            self.rvc_model,
+async def generate_tts_with_rvc(
+    payload,
+    auth_header
+) -> bytes:
 
-            "--index",
-            self.rvc_index,
+    edge_audio = await _call_edge_tts(
+        payload,
+        auth_header
+    )
 
-            "--pitch",
-            str(pitch)
-        ]
+    if not RVC_ENABLED:
+        return edge_audio
 
-        process = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True
-        )
+    try:
 
-        if process.returncode != 0:
-            raise Exception(process.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
 
-        return output_path
+            input_mp3 = os.path.join(
+                tmp,
+                "input.mp3"
+            )
+
+            output_wav = os.path.join(
+                tmp,
+                "output.wav"
+            )
+
+            with open(input_mp3, "wb") as f:
+                f.write(edge_audio)
+
+            cmd = [
+                "python",
+                "infer.py",
+
+                "--input_path",
+                input_mp3,
+
+                "--output_path",
+                output_wav,
+
+                "--model_path",
+                RVC_MODEL,
+
+                "--index_path",
+                RVC_INDEX
+            ]
+
+            subprocess.run(
+                cmd,
+                check=True
+            )
+
+            with open(output_wav, "rb") as f:
+                return f.read()
+
+    except Exception as e:
+
+        print("RVC FALLBACK:", e)
+
+        return edge_audio
