@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from core.RVC import generate_tts_with_rvc
 import os
 import re
 import base64
