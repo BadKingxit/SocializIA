@@ -466,7 +466,7 @@ def _extract_math_expression(message: str) -> Optional[str]:
         return None
 
     expr = m.group(1).strip()
-    expr = re.sub(r"[^0-9.+-*/()% ]", "", expr)
+    expr = re.sub(r"[^0-9.\+\-\*/()% ]", "", expr)
     expr = _normalize_spaces(expr)
     return expr or None
 
