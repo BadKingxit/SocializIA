@@ -1,3 +1,5 @@
+import os
+import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Request, Response
 from pydantic import BaseModel, Field
@@ -27,6 +29,33 @@ app = FastAPI(
 
 app.include_router(voice_router)
 
+# =========================================================
+# CARTESIA CONFIG
+# =========================================================
+
+CARTESIA_API_KEY = os.environ.get(
+    "CARTESIA_API_KEY",
+    ""
+)
+
+CARTESIA_MODEL_ID = os.environ.get(
+    "CARTESIA_MODEL_ID",
+    "sonic-2"
+)
+
+CARTESIA_VOICE_MAP = {
+    "pt_br_female":
+        os.environ.get(
+            "CARTESIA_VOICE_FEMALE",
+            ""
+        ),
+
+    "pt_br_male":
+        os.environ.get(
+            "CARTESIA_VOICE_MALE",
+            ""
+        )
+}
 
 # =========================================================
 # MODELS
@@ -677,7 +706,117 @@ async def voice_tts(
         emotional_state=req.emotional_state
     )
 
+    # =====================================================
+    # CARTESIA PRIMARY
+    # =====================================================
+
     try:
+
+        cartesia_voice_id = CARTESIA_VOICE_MAP.get(
+            voice_meta["resolved_voice_id"],
+            ""
+        )
+
+        if CARTESIA_API_KEY and cartesia_voice_id:
+
+            async with httpx.AsyncClient(
+                timeout=120.0
+            ) as client:
+
+                response = await client.post(
+                    "https://api.cartesia.ai/tts/bytes",
+
+                    headers={
+                        "X-API-Key":
+                            CARTESIA_API_KEY,
+
+                        "Cartesia-Version":
+                            "2024-06-10",
+
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    json={
+                        "model_id":
+                            CARTESIA_MODEL_ID,
+
+                        "transcript":
+                            text,
+
+                        "voice": {
+                            "mode": "id",
+                            "id":
+                                cartesia_voice_id
+                        },
+
+                        "output_format": {
+                            "container": "mp3",
+                            "bit_rate": 128000,
+                            "sample_rate": 48000
+                        }
+                    }
+                )
+
+                response.raise_for_status()
+
+                audio_bytes = response.content
+
+                if audio_bytes and len(audio_bytes) > 100:
+
+                    return Response(
+                        content=audio_bytes,
+
+                        media_type="audio/mpeg",
+
+                        headers={
+                            "Content-Disposition":
+                                'inline; filename="tts_output.mp3"',
+
+                            "X-TTS-Provider":
+                                "cartesia",
+
+                            "X-TTS-Voice":
+                                cartesia_voice_id,
+
+                            "X-Voice-Id":
+                                voice_meta["resolved_voice_id"],
+
+                            "X-Voice-Style":
+                                voice_meta["style"],
+
+                            "X-Voice-Emotion":
+                                voice_meta["emotion_label"],
+
+                            "X-Voice-Rate":
+                                voice_meta["rate"],
+
+                            "X-Voice-Pitch":
+                                voice_meta["pitch"],
+
+                            "X-Voice-Volume":
+                                voice_meta["volume"],
+
+                            "X-Voice-Effects":
+                                ",".join(
+                                    voice_meta["effects"]
+                                )
+                        }
+                    )
+
+    except Exception as cartesia_error:
+
+        print(
+            "[TTS] Cartesia failed:",
+            str(cartesia_error)
+        )
+
+    # =====================================================
+    # EDGE FALLBACK
+    # =====================================================
+
+    try:
+
         import edge_tts
 
         communicate = edge_tts.Communicate(
@@ -696,6 +835,7 @@ async def voice_tts(
                 audio_buffer.extend(chunk["data"])
 
         if not audio_buffer or len(audio_buffer) < 100:
+
             return Response(
                 content='{"error":"Audio vazio"}',
                 status_code=500,
@@ -708,31 +848,42 @@ async def voice_tts(
             media_type="audio/mpeg",
 
             headers={
-                "Content-Disposition": 'inline; filename="tts_output.mp3"',
+                "Content-Disposition":
+                    'inline; filename="tts_output.mp3"',
 
-                "X-TTS-Provider": "edge-tts",
+                "X-TTS-Provider":
+                    "edge-tts-fallback",
 
-                "X-TTS-Voice": voice_meta["provider_voice"],
+                "X-TTS-Voice":
+                    voice_meta["provider_voice"],
 
-                "X-Voice-Id": voice_meta["resolved_voice_id"],
+                "X-Voice-Id":
+                    voice_meta["resolved_voice_id"],
 
-                "X-Voice-Style": voice_meta["style"],
+                "X-Voice-Style":
+                    voice_meta["style"],
 
-                "X-Voice-Emotion": voice_meta["emotion_label"],
+                "X-Voice-Emotion":
+                    voice_meta["emotion_label"],
 
-                "X-Voice-Rate": voice_meta["rate"],
+                "X-Voice-Rate":
+                    voice_meta["rate"],
 
-                "X-Voice-Pitch": voice_meta["pitch"],
+                "X-Voice-Pitch":
+                    voice_meta["pitch"],
 
-                "X-Voice-Volume": voice_meta["volume"],
+                "X-Voice-Volume":
+                    voice_meta["volume"],
 
-                "X-Voice-Effects": ",".join(
-                    voice_meta["effects"]
-                )
+                "X-Voice-Effects":
+                    ",".join(
+                        voice_meta["effects"]
+                    )
             }
         )
 
     except ImportError:
+
         return Response(
             content='{"error":"edge-tts nao instalado"}',
             status_code=503,
@@ -740,6 +891,7 @@ async def voice_tts(
         )
 
     except Exception as e:
+
         import traceback
 
         traceback.print_exc()
@@ -749,7 +901,6 @@ async def voice_tts(
             status_code=500,
             media_type="application/json"
         )
-
 
 @app.get("/voice/tts/info")
 async def voice_tts_info(_=Depends(protect)):
