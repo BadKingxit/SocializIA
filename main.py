@@ -5,7 +5,11 @@ from fastapi import FastAPI, Depends, Request, Response
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import unicodedata
+import json
+import base64
+import websockets
 
+from fastapi.responses import StreamingResponse
 from api.voice import router as voice_router
 from core.chat_handler import handle_chat
 from security import protect
@@ -970,3 +974,180 @@ async def memory_facts(
         "count": len(facts),
         "facts": facts
     }
+    
+
+@app.post("/voice/tts/stream")
+async def voice_tts_stream(
+    req: TTSRequest,
+    _=Depends(protect)
+):
+
+    text = _normalize_text(req.text)
+
+    if not text:
+
+        return Response(
+            content='{"error":"Texto vazio"}',
+            status_code=400,
+            media_type="application/json"
+        )
+
+    voice_meta = _resolve_voice_payload(
+        voice=req.voice,
+        style=req.style,
+        effects=req.effects,
+        rate=req.rate,
+        pitch=req.pitch,
+        volume=req.volume,
+        emotion_label=req.emotion_label,
+        emotional_state=req.emotional_state
+    )
+
+    cartesia_voice_id = CARTESIA_VOICE_MAP.get(
+        voice_meta["resolved_voice_id"],
+        ""
+    )
+
+    if not CARTESIA_API_KEY:
+
+        return Response(
+            content='{"error":"CARTESIA_API_KEY ausente"}',
+            status_code=500,
+            media_type="application/json"
+        )
+
+    if not cartesia_voice_id:
+
+        return Response(
+            content='{"error":"Voice ID inválido"}',
+            status_code=400,
+            media_type="application/json"
+        )
+
+    async def audio_stream():
+
+        uri = (
+            "wss://api.cartesia.ai/tts/websocket"
+            f"?api_key={CARTESIA_API_KEY}"
+            "&cartesia_version=2024-06-10"
+        )
+
+        async with websockets.connect(
+            uri,
+            max_size=None
+        ) as ws:
+
+            payload = {
+
+                "context_id": "socializia",
+
+                "model_id":
+                    CARTESIA_MODEL_ID,
+
+                "transcript":
+                    text,
+
+                "voice": {
+                    "mode": "id",
+                    "id":
+                        cartesia_voice_id
+                },
+
+                "output_format": {
+
+                    "container":
+                        "raw",
+
+                    "encoding":
+                        "pcm_s16le",
+
+                    "sample_rate":
+                        24000
+                }
+            }
+
+            await ws.send(
+                json.dumps(payload)
+            )
+
+            while True:
+
+                try:
+
+                    message = await ws.recv()
+
+                    data = json.loads(message)
+
+                    msg_type = data.get("type")
+
+                    # =====================
+                    # AUDIO CHUNK
+                    # =====================
+
+                    if msg_type == "chunk":
+
+                        chunk_b64 = data.get("data")
+
+                        if chunk_b64:
+
+                            audio_chunk = (
+                                base64.b64decode(
+                                    chunk_b64
+                                )
+                            )
+
+                            yield audio_chunk
+
+                    # =====================
+                    # DONE
+                    # =====================
+
+                    elif msg_type == "done":
+
+                        break
+
+                    # =====================
+                    # ERROR
+                    # =====================
+
+                    elif msg_type == "error":
+
+                        print(
+                            "[Cartesia Stream Error]",
+                            data
+                        )
+
+                        break
+
+                except Exception as stream_error:
+
+                    print(
+                        "[Streaming Error]",
+                        str(stream_error)
+                    )
+
+                    break
+
+    return StreamingResponse(
+        audio_stream(),
+
+        media_type="audio/raw",
+
+        headers={
+
+            "X-TTS-Provider":
+                "cartesia-stream",
+
+            "X-Audio-Format":
+                "pcm_s16le",
+
+            "X-Sample-Rate":
+                "24000",
+
+            "Cache-Control":
+                "no-cache",
+
+            "Connection":
+                "keep-alive"
+        }
+    )
