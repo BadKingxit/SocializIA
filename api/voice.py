@@ -716,11 +716,11 @@ async def bridge_tts(
             )
         }
 
-        audio_bytes = await generate_tts_with_rvc(
-              payload=payload,
-              auth_header=auth_header
-         )
-
+        audio_bytes = await _call_tts(
+              payload,
+              auth_header
+             )
+  
         # =========================
         # MP3 BRUTO
         # =========================
