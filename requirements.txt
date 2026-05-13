@@ -6,3 +6,4 @@ python-multipart
 pydantic
 edge-tts
 httpx
+websockets
